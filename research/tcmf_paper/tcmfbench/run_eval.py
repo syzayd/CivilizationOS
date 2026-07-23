@@ -47,13 +47,27 @@ async def _order(fn, mat):
     return await r if hasattr(r, "__await__") else r
 
 
-async def _eval_methods(mats, method_fns: dict) -> dict:
+async def _eval_methods_rows(mats, method_fns: dict) -> dict:
+    """Per-scenario score rows, unaggregated - lets callers pool rows across seeds
+    before computing mean/std, instead of averaging per-seed averages."""
     per: dict[str, list[dict]] = {name: [] for name in method_fns}
     for mat in mats:
         for name, fn in method_fns.items():
             order = await _order(fn, mat)
             per[name].append(_score(order, mat.gold_ids, mat.root_id))
+    return per
+
+
+async def _eval_methods(mats, method_fns: dict) -> dict:
+    per = await _eval_methods_rows(mats, method_fns)
     return {name: _agg(rows) for name, rows in per.items()}
+
+
+def _analytic_random_recall(gold_count: int, pool_size: int, ks: tuple[int, ...]) -> dict[str, float]:
+    """Expected recall@k of a uniform-random ranking, in closed form: drawing k items
+    without replacement from a pool of `pool_size` containing `gold_count` gold items,
+    E[hits] = k * gold_count / pool_size, so E[recall@k] = k / pool_size (capped at 1)."""
+    return {f"recall@{k}": min(1.0, k / pool_size) for k in ks}
 
 
 def _materialize(cfg, n, seed):
@@ -100,12 +114,41 @@ def _table(title: str, results: dict, order: list[str] | None = None) -> str:
 async def run(args) -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = GenConfig()
-    n, seed = args.n, args.seed
+    cfg_overrides = {}
+    if args.n_distractors is not None:
+        cfg_overrides["n_distractors"] = args.n_distractors
+    if args.n_noise is not None:
+        cfg_overrides["n_noise"] = args.n_noise
+    base = GenConfig(**cfg_overrides)
+    n = args.n
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
+    seed = seeds[0]  # used below for the (single-seed) ablations
 
-    # ---- main comparison ----
+    # ---- main comparison, pooled across all seeds ----
+    # Each seed's scenarios are independent draws; pool the per-scenario rows before
+    # computing mean/std rather than averaging per-seed averages, so the aggregate std
+    # reflects the full n*len(seeds) sample.
+    per_seed_rows: dict[int, dict[str, list[dict]]] = {}
+    for s in seeds:
+        mats_s = _materialize(base, n, s)
+        per_seed_rows[s] = await _eval_methods_rows(mats_s, main_methods())
+
+    pooled_rows: dict[str, list[dict]] = {name: [] for name in main_methods()}
+    for s in seeds:
+        for name, rows in per_seed_rows[s].items():
+            pooled_rows[name].extend(rows)
+    main = {name: _agg(rows) for name, rows in pooled_rows.items()}
+
+    per_seed_agg = {s: {name: _agg(rows) for name, rows in per_seed_rows[s].items()}
+                     for s in seeds}
+
+    gold_count = (base.chain_len - 1) * base.witnesses_per_ancestor
+    pool_size = gold_count + base.n_distractors + base.n_noise
+    analytic_random = _analytic_random_recall(gold_count, pool_size, KS)
+
+    # ---- remaining ablations run on a single seed (seeds[0]); multi-seeding those is
+    # out of scope for this pass - see NIGHT_LOG.md ----
     mats = _materialize(base, n, seed)
-    main = await _eval_methods(mats, main_methods())
 
     # ---- ablation: fusion operator (same episodic + same causal boosts) ----
     fusion = await _eval_methods(mats, {
@@ -155,19 +198,43 @@ async def run(args) -> None:
         cells = [f"{diff_rows[a][meth]['recall@5'][0]:.2f}" for a in diff_rows]
         diff_tbl.append(f"| {meth} | " + " | ".join(cells) + " |")
 
-    gold = (base.chain_len - 1) * base.witnesses_per_ancestor
+    gold = gold_count
+    # per-seed recall@10 stability table (main methods only)
+    seed_tbl = ["### Main comparison recall@10, per seed (stability check)", "",
+                "| method | " + " | ".join(f"seed={s}" for s in seeds) + " | pooled |",
+                "|" + "---|" * (len(seeds) + 2)]
+    for name in MAIN_ORDER:
+        cells = [f"{per_seed_agg[s][name]['recall@10'][0]:.2f}" for s in seeds]
+        seed_tbl.append(f"| {name} | " + " | ".join(cells) + f" | {main[name]['recall@10'][0]:.2f} |")
+
+    rand_tbl = ["### Random-baseline sanity check (analytic vs measured)", "",
+                f"pool size = {gold} gold + {base.n_distractors} distractors + "
+                f"{base.n_noise} noise = {pool_size}", "",
+                "| k | analytic E[recall@k] = k/pool | measured (random, pooled) |",
+                "|---|---|---|"]
+    for k in KS:
+        rand_tbl.append(
+            f"| {k} | {analytic_random[f'recall@{k}']:.3f} | "
+            f"{main['random'][f'recall@{k}'][0]:.3f} |"
+        )
+
     md = [
         "# TCMF Benchmark Results",
         "",
-        f"Scenarios: {n} | seed: {seed} | dim: {base.dim} | chain_len: {base.chain_len} | "
-        f"distractors: {base.n_distractors} | noise: {base.n_noise} | "
+        f"Scenarios: {n} per seed | seeds: {seeds} ({len(seeds)}x{n} = {n * len(seeds)} total) | "
+        f"dim: {base.dim} | chain_len: {base.chain_len} | "
+        f"distractors: {base.n_distractors} | noise: {base.n_noise} | pool size: {pool_size} | "
         f"alpha_mem: {base.alpha_mem} | gold/scenario: {gold}",
         "",
-        "Mean±std over scenarios. `root_rank` = mean rank of the root-cause memory (lower better). "
-        "The mechanism under test is the real `api.memory.tcmf.TCMFRetriever`; baselines and "
-        "fusion variants share identical episodic scores and causal boosts.",
+        "Mean±std over scenarios (main comparison pools scenarios across all seeds before "
+        "computing mean/std; remaining ablations use seed[0] only). `root_rank` = mean rank of "
+        "the root-cause memory (lower better). The mechanism under test is the real "
+        "`api.memory.tcmf.TCMFRetriever`; baselines and fusion variants share identical episodic "
+        "scores and causal boosts.",
         "",
         _table("Main comparison", main, MAIN_ORDER), "",
+        "\n".join(seed_tbl), "",
+        "\n".join(rand_tbl), "",
         _table("Ablation: fusion operator (F3/F4)", fusion), "",
         _table("Ablation: additive causal weight lambda", lam_ab), "",
         _table("Ablation: causal_sim_threshold", thr_ab), "",
@@ -180,13 +247,18 @@ async def run(args) -> None:
         return {nm: {k: {"mean": v[0], "std": v[1]} for k, v in agg.items()}
                 for nm, agg in d.items()}
     (out_dir / "results.json").write_text(json.dumps({
-        "config": vars(base), "n": n, "seed": seed,
-        "main": _ser(main), "fusion": _ser(fusion), "lambda": _ser(lam_ab),
+        "config": vars(base), "n": n, "seeds": seeds, "pool_size": pool_size,
+        "analytic_random_recall": analytic_random,
+        "main": _ser(main),
+        "per_seed": {str(s): _ser(a) for s, a in per_seed_agg.items()},
+        "fusion": _ser(fusion), "lambda": _ser(lam_ab),
         "threshold": _ser(thr_ab), "depth": _ser(depth_ab),
         "difficulty": {a: _ser(v) for a, v in diff_rows.items()},
     }, indent=2), encoding="utf-8")
 
     print(_table("Main comparison", main, MAIN_ORDER).replace("### ", "== "))
+    print("\n" + "\n".join(seed_tbl).replace("### ", "== "))
+    print("\n" + "\n".join(rand_tbl).replace("### ", "== "))
     print("\n" + _table("Fusion operator", fusion).replace("### ", "== "))
     print("\n" + "\n".join(diff_tbl).replace("### ", "== "))
     print(f"\nWrote {out_dir/'RESULTS.md'} and {out_dir/'results.json'}")
@@ -196,6 +268,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="TCMF benchmark runner")
     p.add_argument("--n", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seeds", type=str, default=None,
+                    help="comma-separated base seeds, e.g. '0,1,2,3,4'; overrides --seed and "
+                         "pools the main comparison's per-scenario rows across all of them")
+    p.add_argument("--n-distractors", type=int, default=None,
+                    help="override GenConfig.n_distractors (default 6)")
+    p.add_argument("--n-noise", type=int, default=None,
+                    help="override GenConfig.n_noise (default 8)")
     p.add_argument("--out", type=str, default="results")
     return p.parse_args()
 
