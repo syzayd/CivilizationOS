@@ -39,12 +39,25 @@ async def _order(fn, mat):
     return await r if hasattr(r, "__await__") else r
 
 
-async def _eval(mats, method_fns):
+async def _eval_rows(mats, method_fns):
+    """Per-scenario score rows, unaggregated - lets callers pool rows across seeds
+    before computing mean/std, instead of averaging per-seed averages."""
     per = {n: [] for n in method_fns}
     for mat in mats:
         for name, fn in method_fns.items():
             per[name].append(_score(await _order(fn, mat), mat))
+    return per
+
+
+async def _eval(mats, method_fns):
+    per = await _eval_rows(mats, method_fns)
     return {n: _agg(rows) for n, rows in per.items()}
+
+
+def _analytic_random_recall(gold_count: int, pool_size: int, ks) -> dict[str, float]:
+    """Expected recall@k of a uniform-random ranking: E[recall@k] = k / pool_size
+    (hypergeometric mean), capped at 1."""
+    return {f"recall@{k}": min(1.0, k / pool_size) for k in ks}
 
 
 _COLS = [f"recall@{k}" for k in KS] + ["causal@5", "semantic@5", "root_mrr", "root_rank"]
@@ -64,6 +77,7 @@ def _table(title, results, order=None):
 
 def _methods():
     return {
+        "random":       lambda m: M.rank_random(m, seed=1234),
         "semantic_rag": M.rank_semantic,
         "episodic":     M.rank_episodic,
         "causal_only":  lambda m: M.rank_causal_only(m, clean=True),
@@ -75,7 +89,7 @@ def _methods():
     }
 
 
-ORDER = ["semantic_rag", "episodic", "causal_only", "graph_ppr",
+ORDER = ["random", "semantic_rag", "episodic", "causal_only", "graph_ppr",
          "tcmf_mult", "tcmf_add", "tcmf_shipped", "tcmf_rrf"]
 
 
@@ -87,11 +101,33 @@ def _mats(cfg, n, seed):
 async def run(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    n, seed = args.n, args.seed
+    n = args.n
+    cfg_overrides = {}
+    if args.n_distractors is not None:
+        cfg_overrides["n_distractors"] = args.n_distractors
+    if args.n_noise is not None:
+        cfg_overrides["n_noise"] = args.n_noise
+    base = MixedConfig(**cfg_overrides)
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
+    seed = seeds[0]  # used below for the (single-seed) ablations
 
-    base = MixedConfig()
-    mats = _mats(base, n, seed)
-    main = await _eval(mats, _methods())
+    # ---- main comparison, pooled across all seeds (see run_eval.py for rationale) ----
+    per_seed_rows = {}
+    for s in seeds:
+        per_seed_rows[s] = await _eval_rows(_mats(base, n, s), _methods())
+
+    pooled_rows = {name: [] for name in _methods()}
+    for s in seeds:
+        for name, rows in per_seed_rows[s].items():
+            pooled_rows[name].extend(rows)
+    main = {name: _agg(rows) for name, rows in pooled_rows.items()}
+    per_seed_agg = {s: {name: _agg(rows) for name, rows in per_seed_rows[s].items()}
+                     for s in seeds}
+
+    pool_size = base.total_gold() + base.n_distractors + base.n_noise
+    analytic_random = _analytic_random_recall(base.total_gold(), pool_size, KS)
+
+    mats = _mats(base, n, seed)  # single-seed pool for the remaining ablations
 
     # lambda tradeoff: causal weight vs which gold type is recovered
     lam_ab = await _eval(mats, {
@@ -117,19 +153,44 @@ async def run(args):
     for m in drop_methods:
         ctbl.append(f"| {m} | " + " | ".join(f"{curve[p][m]:.2f}" for p in dropouts) + " |")
 
+    seed_tbl = ["### Main comparison recall@10, per seed (stability check)", "",
+                "| method | " + " | ".join(f"seed={s}" for s in seeds) + " | pooled |",
+                "|" + "---|" * (len(seeds) + 2)]
+    for name in ORDER:
+        cells = [f"{per_seed_agg[s][name]['recall@10'][0]:.2f}" for s in seeds]
+        seed_tbl.append(f"| {name} | " + " | ".join(cells) + f" | {main[name]['recall@10'][0]:.2f} |")
+
+    rand_tbl = ["### Random-baseline sanity check (analytic vs measured)", "",
+                f"pool size = {base.total_gold()} gold + {base.n_distractors} distractors + "
+                f"{base.n_noise} noise = {pool_size}", "",
+                "| k | analytic E[recall@k] = k/pool | measured (random, pooled) |",
+                "|---|---|---|"]
+    for k in KS:
+        rand_tbl.append(
+            f"| {k} | {analytic_random[f'recall@{k}']:.3f} | "
+            f"{main['random'][f'recall@{k}'][0]:.3f} |"
+        )
+
     md = [
         "# TCMF Benchmark: Mixed Regime",
         "",
-        f"Scenarios: {n} | seed: {seed} | chain_len: {base.chain_len} | "
+        f"Scenarios: {n} per seed | seeds: {seeds} ({len(seeds)}x{n} = {n * len(seeds)} total) | "
+        f"chain_len: {base.chain_len} | "
         f"semantic_gold: {base.n_semantic_gold} | distractors: {base.n_distractors} | "
-        f"noise: {base.n_noise} | total gold: {base.total_gold()} "
+        f"noise: {base.n_noise} | pool size: {pool_size} | total gold: {base.total_gold()} "
         f"({base.chain_len - 1} causal + {base.n_semantic_gold} semantic)",
         "",
         "Neither signal alone recovers both gold types: `causal@5` = recall over causal-gold "
         "(graph-findable), `semantic@5` = recall over semantic-gold (similarity-findable). "
-        "Additive TCMF should dominate both single-signal baselines on overall recall.",
+        "Additive TCMF should dominate both single-signal baselines on overall recall. Main "
+        "comparison pools scenarios across all seeds before computing mean/std; the lambda "
+        "tradeoff and dropout curve below use seed[0] only.",
         "",
         _table("Main comparison (mixed regime)", main, ORDER),
+        "",
+        "\n".join(seed_tbl),
+        "",
+        "\n".join(rand_tbl),
         "",
         _table("Additive lambda tradeoff (causal@5 vs semantic@5)", lam_ab),
         "",
@@ -137,16 +198,21 @@ async def run(args):
         "",
     ]
     (out / "RESULTS_MIXED.md").write_text("\n".join(md), encoding="utf-8")
+
+    def _ser(d):
+        return {nm: {k: {"mean": v[0], "std": v[1]} for k, v in a.items()} for nm, a in d.items()}
     (out / "results_mixed.json").write_text(json.dumps({
-        "config": vars(base), "n": n, "seed": seed,
-        "main": {nm: {k: {"mean": v[0], "std": v[1]} for k, v in a.items()}
-                 for nm, a in main.items()},
-        "lambda_tradeoff": {nm: {k: {"mean": v[0], "std": v[1]} for k, v in a.items()}
-                            for nm, a in lam_ab.items()},
+        "config": vars(base), "n": n, "seeds": seeds, "pool_size": pool_size,
+        "analytic_random_recall": analytic_random,
+        "main": _ser(main),
+        "per_seed": {str(s): _ser(a) for s, a in per_seed_agg.items()},
+        "lambda_tradeoff": _ser(lam_ab),
         "dropout_curve": {str(p): curve[p] for p in dropouts},
     }, indent=2), encoding="utf-8")
 
     print(_table("Main comparison (mixed regime)", main, ORDER).replace("### ", "== "))
+    print("\n" + "\n".join(seed_tbl).replace("### ", "== "))
+    print("\n" + "\n".join(rand_tbl).replace("### ", "== "))
     print("\n" + "\n".join(ctbl).replace("### ", "== "))
     print(f"\nWrote {out/'RESULTS_MIXED.md'} and {out/'results_mixed.json'}")
 
@@ -155,6 +221,13 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seeds", type=str, default=None,
+                    help="comma-separated base seeds, e.g. '0,1,2,3,4'; overrides --seed and "
+                         "pools the main comparison's per-scenario rows across all of them")
+    p.add_argument("--n-distractors", type=int, default=None,
+                    help="override MixedConfig.n_distractors (default 6)")
+    p.add_argument("--n-noise", type=int, default=None,
+                    help="override MixedConfig.n_noise (default 8)")
     p.add_argument("--out", type=str, default="results_mixed")
     return p.parse_args()
 

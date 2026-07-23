@@ -213,11 +213,86 @@ weighting (fix #3) reliably places the root-cause memory inside the top-5 the ad
 depth-direction fix matters for decisions, not just for the root_rank metric. This is the paper's
 answer to "so what if a ranking metric moved": the fusion operator changes what the agent decides.
 
+## N01 - Realistic candidate pool (pool~80) + multi-seed harness (2026-07-23)
+
+Every number above sits on a pool of 17-19 candidate memories (3 gold + 6 distractors + 8
+noise, or 5 gold + 6 distractors + 8 noise in the mixed regime). That is the paper's single
+biggest reviewer objection ("small handcrafted benchmark"). This night reran both the pure and
+mixed regimes at a pool of ~80 (20 distractors, 55 noise, same chain_len=4) across 5
+independent seeds (`--seeds 0,1,2,3,4`, n=300 scenarios each, 1500 scenarios pooled per
+regime), and added a closed-form sanity check on the harness itself.
+
+Run:
+```
+python -m tcmfbench.run_eval  --n 300 --seeds 0,1,2,3,4 --n-distractors 20 --n-noise 55 --out results_main_pool80
+python -m tcmfbench.run_mixed --n 300 --seeds 0,1,2,3,4 --n-distractors 20 --n-noise 55 --out results_mixed_pool80
+```
+Full tables: `results_main_pool80/RESULTS.md`, `results_mixed_pool80/RESULTS_MIXED.md`.
+
+**Harness sanity check.** The `random` baseline's measured recall@k now matches the closed-form
+hypergeometric expectation `k/pool` (unit-tested in `tcmfbench/tests/test_pool_scaling.py`):
+recall@10 analytic 0.128 vs measured 0.139 (pure), 0.125 vs 0.134 (mixed) - the harness is
+behaving as designed, not silently truncating the enlarged pool. Also confirmed directly:
+`materialize()`'s per-citizen split scales `n_citizens` with pool size and every downstream
+`retrieve()` call passes `k` far above the pool, so nothing is pruned before scoring (verified
+for pool sizes 17 and 78 in the same test file).
+
+**Per-seed stability.** All 5 seeds agree to 2 decimal places on every method's recall@10 in
+both regimes (see the per-seed tables in the two `RESULTS*.md` files) - these are not
+one-off numbers.
+
+**Pure regime: the margin survives, with one real degradation.** `tcmf_add` still ties the
+causal oracle exactly (recall@10 = 1.00) and both crush every non-causal baseline
+(semantic_rag/episodic = 0.00, tcmf_mult = 0.01, graph_ppr = 0.33, tcmf_rrf = 0.97). But the
+REAL shipped retriever's recall@10 falls from 1.00 (old pool) to **0.80** at pool~78. It still
+dominates every non-causal-aware baseline by a wide margin and still places the root cause at
+rank 1 unchanged (root_mrr = 1.00, root_rank = 1.0), but "tcmf_shipped recall@10 = 1.00" is no
+longer a true statement at realistic scale - update the paper's pure-regime headline number.
+
+**Mixed regime: the margin against graph_ppr does NOT survive.** At the old pool, tcmf_add
+(0.98) and tcmf_shipped clearly beat graph_ppr (0.80) on overall recall@10. At pool~80,
+graph_ppr's recall@10 is **unchanged at 0.80**, while tcmf_add falls to **0.79** and
+tcmf_shipped falls to **0.73** - graph_ppr now edges out both. This is stable across all 5
+seeds (identical to 2 decimals), so it is not sampling noise. The `causal@5`/`semantic@5`
+breakdown explains it: tcmf_add still perfectly recovers causal-gold (causal@5 = 1.00,
+unchanged) but its semantic-gold recovery collapses from 0.38 (old pool) to **0.18** at the
+larger pool, because `lambda=4` (tuned by eye at the old, small pool) now overweights the
+causal term relative to a much larger competing episodic pool, crowding out the semantic-gold
+memories tcmf_add used to also retrieve. graph_ppr is structurally insensitive to this: it
+scores memories by proximity to graph *events*, not by competing in a normalized episodic pool
+against 55 extra noise memories, so its recall@10 does not move.
+
+**Honest verdict.** F6's claim "fusion strictly beats either single signal" (vs causal_only,
+vs semantic_rag) survives comfortably at realistic scale in both regimes. F6's stronger claim
+"and beats every baseline including graph_ppr/HippoRAG-style retrieval" does **not** survive
+unchanged in the mixed regime - graph_ppr is now a peer competitor on overall recall@10, not
+something TCMF strictly dominates, at this pool size and this lambda. Root-cause placement
+(root_mrr/root_rank, the F8/decision-tier story) is completely unaffected in both regimes.
+This looks like a lambda-tuning artifact rather than a fundamental limitation: lambda=4 was
+picked by eye at pool~19 and never revisited for pool~80. N03 (held-out tune/test split) will
+retune lambda properly at this pool size on the tune split only - report whichever way that
+goes, including if it does not recover the margin.
+
+**LaTeX delta needed in the private paper repo** (could not reach `syzayd/tcmf-paper` from
+this sandbox - no `gh` CLI available here - recorded as prose, see NIGHT_LOG.md 2026-07-23):
+1. Any claim of the form "TCMF beats every baseline at recall@10 in both regimes" needs to
+   become regime-specific: pure regime holds at pool~80; mixed regime does not vs graph_ppr
+   until N03's retune is checked.
+2. Add the pool-size ablation table (recall@10 at pool~19 vs pool~80, both regimes, all
+   methods) as a robustness figure/table, sourced from `results_main_pool80/results.json` and
+   `results_mixed_pool80/results_mixed.json`.
+3. Note the benchmark's synthetic tiers are now validated at pool sizes up to 80 across 5
+   independent seeds (1500 scenarios per regime), with a closed-form random-baseline check,
+   not just the original ~19-candidate pool.
+
 ## Still open before submission
 
-- **Write-up** (Phase 5) drafted (kept in a private repo); fold in the F8 decision tier + table.
+- **Write-up** (Phase 5) drafted (kept in a private repo); fold in the F8 decision tier + table
+  and the N01 pool-size finding above (including the mixed-regime graph_ppr result).
 - **Scale the real-text tier** (more domains / larger n) and add a second encoder to show the
   threshold-tuning point generalizes.
-- **Statistical rigor / robustness** (REVIEW.md B4-B5, W7): multi-seed + paired significance,
-  a held-out lambda/tau split, and a spurious-edge (not just missing-edge) robustness study.
+- **Statistical rigor / robustness** (REVIEW.md B4-B5, W7): N01 (larger pool + multi-seed)
+  done this night, still open: paired significance / bootstrap CIs (N02), a held-out lambda/tau
+  split (N03, and now also the fix for the mixed-regime lambda-crowding finding above), and a
+  spurious-edge (not just missing-edge) robustness study (N04).
 </content>
