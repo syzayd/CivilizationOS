@@ -14,16 +14,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import statistics as st
 from pathlib import Path
+
+import numpy as np
 
 from . import _bootstrap  # noqa: F401
 from .generator import GenConfig, generate_many
 from . import methods as M
 from . import metrics as MT
+from .stats import bootstrap_ci, holm_bonferroni, wilcoxon_signed_rank
 
 KS = (1, 3, 5, 10)
 _COLS = [f"recall@{k}" for k in KS] + ["root_mrr", "root_rank", "ndcg@10"]
+
+# N01: distinct --seeds entries are offset by this stride before being used as generator
+# base seeds, so e.g. --seeds 0,1,2,3,4 with --n 300 cannot regenerate overlapping scenarios
+# (generate_many draws base_seed .. base_seed+n-1). See test_n01_scale.py.
+SEED_STRIDE = 100_000
 
 
 def _score(ranked, gold, root) -> dict[str, float]:
@@ -34,12 +41,14 @@ def _score(ranked, gold, root) -> dict[str, float]:
     return out
 
 
-def _agg(rows: list[dict[str, float]]) -> dict[str, tuple[float, float]]:
-    return {
-        k: (st.mean(r[k] for r in rows),
-            st.pstdev([r[k] for r in rows]) if len(rows) > 1 else 0.0)
-        for k in rows[0]
-    }
+def _agg(rows: list[dict[str, float]], seed: int = 0) -> dict[str, tuple[float, float, float]]:
+    """{metric: (mean, ci_lo, ci_hi)} via seeded percentile bootstrap over scenarios (N02)."""
+    out = {}
+    for k in rows[0]:
+        vals = np.array([r[k] for r in rows], dtype=float)
+        vals = vals[~np.isnan(vals)]
+        out[k] = bootstrap_ci(vals, seed=seed) if len(vals) else (float("nan"),) * 3
+    return out
 
 
 async def _order(fn, mat):
@@ -47,9 +56,7 @@ async def _order(fn, mat):
     return await r if hasattr(r, "__await__") else r
 
 
-async def _eval_methods_rows(mats, method_fns: dict) -> dict:
-    """Per-scenario score rows, unaggregated - lets callers pool rows across seeds
-    before computing mean/std, instead of averaging per-seed averages."""
+async def _eval_methods_raw(mats, method_fns: dict) -> dict[str, list[dict]]:
     per: dict[str, list[dict]] = {name: [] for name in method_fns}
     for mat in mats:
         for name, fn in method_fns.items():
@@ -58,21 +65,32 @@ async def _eval_methods_rows(mats, method_fns: dict) -> dict:
     return per
 
 
-async def _eval_methods(mats, method_fns: dict) -> dict:
-    per = await _eval_methods_rows(mats, method_fns)
+def _eval_methods_agg(per: dict[str, list[dict]]) -> dict:
     return {name: _agg(rows) for name, rows in per.items()}
 
 
-def _analytic_random_recall(gold_count: int, pool_size: int, ks: tuple[int, ...]) -> dict[str, float]:
-    """Expected recall@k of a uniform-random ranking, in closed form: drawing k items
-    without replacement from a pool of `pool_size` containing `gold_count` gold items,
-    E[hits] = k * gold_count / pool_size, so E[recall@k] = k / pool_size (capped at 1)."""
-    return {f"recall@{k}": min(1.0, k / pool_size) for k in ks}
+async def _eval_methods(mats, method_fns: dict) -> dict:
+    return _eval_methods_agg(await _eval_methods_raw(mats, method_fns))
 
 
 def _materialize(cfg, n, seed):
     return [M.materialize(sc, cfg.max_mem_per_citizen)
             for sc in generate_many(n, cfg, base_seed=seed)]
+
+
+def _parse_seeds(args) -> list[int]:
+    if args.seeds:
+        return [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    return [args.seed]
+
+
+def _cfg_overrides(args) -> dict:
+    kw = {}
+    if args.n_distractors is not None:
+        kw["n_distractors"] = args.n_distractors
+    if args.n_noise is not None:
+        kw["n_noise"] = args.n_noise
+    return kw
 
 
 # ------------------------------------------------------------------ method definitions
@@ -105,50 +123,107 @@ def _table(title: str, results: dict, order: list[str] | None = None) -> str:
              "|" + "---|" * (len(_COLS) + 1)]
     for name in names:
         agg = results[name]
-        cells = [f"{agg[c][0]:.2f}±{agg[c][1]:.2f}" if c != "root_rank"
-                 else f"{agg[c][0]:.1f}" for c in _COLS]
+        cells = [
+            (f"{agg[c][0]:.2f} [{agg[c][1]:.2f}, {agg[c][2]:.2f}]" if c != "root_rank"
+             else f"{agg[c][0]:.1f} [{agg[c][1]:.1f}, {agg[c][2]:.1f}]")
+            for c in _COLS
+        ]
         lines.append(f"| {name} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
+
+
+def _significance_table(pooled_raw: dict[str, list[dict]], order: list[str], ref: str,
+                         metrics: tuple[str, ...] = ("recall@5", "root_rank")) -> str:
+    """Paired Wilcoxon signed-rank test, `ref` vs every other method in `order`, on each of
+    `metrics`, per-scenario-paired (same scenario index across methods). Holm-Bonferroni
+    corrected across the whole family of contrasts (N02)."""
+    others = [m for m in order if m != ref and m in pooled_raw]
+    ref_vals = {metric: np.array([r[metric] for r in pooled_raw[ref]]) for metric in metrics}
+    rows, raw_p = [], []
+    for m in others:
+        for metric in metrics:
+            other_vals = np.array([r[metric] for r in pooled_raw[m]])
+            p = wilcoxon_signed_rank(ref_vals[metric], other_vals)
+            diff = float(ref_vals[metric].mean() - other_vals.mean())
+            rows.append((m, metric, diff))
+            raw_p.append(p)
+    adj_p = holm_bonferroni(raw_p) if raw_p else []
+    lines = [
+        f"### Significance: {ref} vs every baseline (paired Wilcoxon signed-rank, "
+        f"Holm-Bonferroni corrected across all {len(raw_p)} contrasts)",
+        "",
+        f"Positive diff = {ref} higher (better for recall, worse for root_rank - lower "
+        "root_rank is better). p_holm <= 0.05 is significant after correction.",
+        "",
+        "| baseline | metric | mean diff | p (raw) | p (holm) |",
+        "|---|---|---|---|---|",
+    ]
+    for (m, metric, diff), p_raw, p_h in zip(rows, raw_p, adj_p):
+        lines.append(f"| {m} | {metric} | {diff:+.3f} | {p_raw:.4f} | {p_h:.4f} |")
+    return "\n".join(lines)
+
+
+def _verify_null_contrast_is_null(pooled_raw: dict[str, list[dict]], ref: str) -> None:
+    """N02's own verification criterion, checked against real run data (not just unit
+    tests): a method against itself must return p ~= 1.0 and a bootstrap CI of the paired
+    difference containing zero."""
+    vals = np.array([r["recall@5"] for r in pooled_raw[ref]], dtype=float)
+    p_self = wilcoxon_signed_rank(vals, vals)
+    assert abs(p_self - 1.0) < 1e-9, f"self-contrast p should be 1.0, got {p_self}"
+    zero_diff = vals - vals
+    _, lo, hi = bootstrap_ci(zero_diff, seed=0)
+    assert lo <= 0.0 <= hi, f"self-contrast CI should contain 0, got [{lo}, {hi}]"
 
 
 async def run(args) -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cfg_overrides = {}
-    if args.n_distractors is not None:
-        cfg_overrides["n_distractors"] = args.n_distractors
-    if args.n_noise is not None:
-        cfg_overrides["n_noise"] = args.n_noise
-    base = GenConfig(**cfg_overrides)
+    overrides = _cfg_overrides(args)
+    base = GenConfig(**overrides)
     n = args.n
-    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
-    seed = seeds[0]  # used below for the (single-seed) ablations
+    seeds = _parse_seeds(args)
+    multiseed = bool(args.seeds)
 
-    # ---- main comparison, pooled across all seeds ----
-    # Each seed's scenarios are independent draws; pool the per-scenario rows before
-    # computing mean/std rather than averaging per-seed averages, so the aggregate std
-    # reflects the full n*len(seeds) sample.
-    per_seed_rows: dict[int, dict[str, list[dict]]] = {}
+    # ---- main comparison: pool scenarios across every --seeds entry (N01 multi-seed harness).
+    # Each seed is offset by SEED_STRIDE so scenarios are guaranteed disjoint (see
+    # test_n01_scale.py::test_seed_stride_gives_disjoint_scenarios), not just re-permuted. ----
+    per_seed_raw: dict[int, dict[str, list[dict]]] = {}
+    mats_by_seed: dict[int, list] = {}
     for s in seeds:
-        mats_s = _materialize(base, n, s)
-        per_seed_rows[s] = await _eval_methods_rows(mats_s, main_methods())
+        base_seed = s * SEED_STRIDE if multiseed else s
+        ms = _materialize(base, n, base_seed)
+        mats_by_seed[s] = ms
+        per_seed_raw[s] = await _eval_methods_raw(ms, main_methods())
 
-    pooled_rows: dict[str, list[dict]] = {name: [] for name in main_methods()}
-    for s in seeds:
-        for name, rows in per_seed_rows[s].items():
-            pooled_rows[name].extend(rows)
-    main = {name: _agg(rows) for name, rows in pooled_rows.items()}
+    pooled_raw = {name: sum((per_seed_raw[s][name] for s in seeds), [])
+                  for name in main_methods()}
+    main = _eval_methods_agg(pooled_raw)
+    mats = sum(mats_by_seed.values(), [])  # pooled scenarios feed every ablation below
+    n_total = len(mats)
 
-    per_seed_agg = {s: {name: _agg(rows) for name, rows in per_seed_rows[s].items()}
-                     for s in seeds}
+    # N02: paired significance, tcmf_add vs every other method, Holm-corrected. Verified
+    # against real run data (not just the unit tests in test_stats.py): a method-against-
+    # itself contrast must return p ~= 1.0 and a CI containing zero.
+    _verify_null_contrast_is_null(pooled_raw, ref="tcmf_add")
+    significance = _significance_table(pooled_raw, MAIN_ORDER, ref="tcmf_add")
 
-    gold_count = (base.chain_len - 1) * base.witnesses_per_ancestor
-    pool_size = gold_count + base.n_distractors + base.n_noise
-    analytic_random = _analytic_random_recall(gold_count, pool_size, KS)
+    # ---- seed-stability check: does the headline margin hold on every individual seed, or
+    # only in the pooled average? (guards against a fluke of a single base seed) ----
+    seed_stability = None
+    if len(seeds) > 1:
+        headline = ["random", "semantic_rag", "causal_only", "tcmf_add", "tcmf_shipped"]
+        seed_stability = {
+            s: {m: _agg(per_seed_raw[s][m])["recall@10"][0] for m in headline}
+            for s in seeds
+        }
 
-    # ---- remaining ablations run on a single seed (seeds[0]); multi-seeding those is
-    # out of scope for this pass - see NIGHT_LOG.md ----
-    mats = _materialize(base, n, seed)
+    # ---- analytic random-baseline sanity check: E[recall@k] of a uniform random ranking is
+    # k/pool_size in closed form (test_n01_scale.py), independent of gold count. If the
+    # empirical `random` baseline diverges from this, some pipeline stage is silently
+    # re-capping the candidate pool. ----
+    pool_size = len(mats[0].all_ids) if mats else 0
+    analytic_random = {k: MT.analytic_random_recall_at_k(pool_size, k) for k in KS}
+    empirical_random = {k: main["random"][f"recall@{k}"][0] for k in KS}
 
     # ---- ablation: fusion operator (same episodic + same causal boosts) ----
     fusion = await _eval_methods(mats, {
@@ -180,8 +255,8 @@ async def run(args) -> None:
     # ---- ablation: difficulty (embedding alignment alpha) ----
     diff_rows = {}
     for a in (0.75, 0.80, 0.85, 0.90, 0.95):
-        cfg = GenConfig(alpha_mem=a, alpha_query=a)
-        dm = _materialize(cfg, n, seed)
+        cfg = GenConfig(alpha_mem=a, alpha_query=a, **overrides)
+        dm = sum((_materialize(cfg, n, (s * SEED_STRIDE if multiseed else s)) for s in seeds), [])
         diff_rows[f"alpha={a}"] = await _eval_methods(dm, {
             "semantic_rag": M.rank_semantic,
             "causal_only":  lambda m: M.rank_causal_only(m, clean=True),
@@ -198,43 +273,41 @@ async def run(args) -> None:
         cells = [f"{diff_rows[a][meth]['recall@5'][0]:.2f}" for a in diff_rows]
         diff_tbl.append(f"| {meth} | " + " | ".join(cells) + " |")
 
-    gold = gold_count
-    # per-seed recall@10 stability table (main methods only)
-    seed_tbl = ["### Main comparison recall@10, per seed (stability check)", "",
-                "| method | " + " | ".join(f"seed={s}" for s in seeds) + " | pooled |",
-                "|" + "---|" * (len(seeds) + 2)]
-    for name in MAIN_ORDER:
-        cells = [f"{per_seed_agg[s][name]['recall@10'][0]:.2f}" for s in seeds]
-        seed_tbl.append(f"| {name} | " + " | ".join(cells) + f" | {main[name]['recall@10'][0]:.2f} |")
+    gold = (base.chain_len - 1) * base.witnesses_per_ancestor
 
-    rand_tbl = ["### Random-baseline sanity check (analytic vs measured)", "",
-                f"pool size = {gold} gold + {base.n_distractors} distractors + "
-                f"{base.n_noise} noise = {pool_size}", "",
-                "| k | analytic E[recall@k] = k/pool | measured (random, pooled) |",
+    rand_tbl = ["### Analytic vs empirical random baseline (N01 sanity check)", "",
+                "| k | analytic k/pool | empirical random recall@k |",
                 "|---|---|---|"]
     for k in KS:
-        rand_tbl.append(
-            f"| {k} | {analytic_random[f'recall@{k}']:.3f} | "
-            f"{main['random'][f'recall@{k}'][0]:.3f} |"
-        )
+        rand_tbl.append(f"| {k} | {analytic_random[k]:.4f} | {empirical_random[k]:.4f} |")
+
+    seed_tbl_lines = []
+    if seed_stability is not None:
+        seed_tbl_lines = ["### Seed stability: recall@10 per individual seed (not pooled)", "",
+                           "| seed | " + " | ".join(headline) + " |",
+                           "|" + "---|" * (len(headline) + 1)]
+        for s in seeds:
+            row = seed_stability[s]
+            seed_tbl_lines.append(f"| {s} | " + " | ".join(f"{row[m]:.2f}" for m in headline) + " |")
 
     md = [
         "# TCMF Benchmark Results",
         "",
-        f"Scenarios: {n} per seed | seeds: {seeds} ({len(seeds)}x{n} = {n * len(seeds)} total) | "
+        f"Scenarios: {n} per seed x {len(seeds)} seed(s) = {n_total} total | "
+        f"seeds: {seeds} ({'multi-seed, stride ' + str(SEED_STRIDE) if multiseed else 'single-seed legacy mode'}) | "
         f"dim: {base.dim} | chain_len: {base.chain_len} | "
-        f"distractors: {base.n_distractors} | noise: {base.n_noise} | pool size: {pool_size} | "
+        f"distractors: {base.n_distractors} | noise: {base.n_noise} | pool/scenario: {pool_size} | "
         f"alpha_mem: {base.alpha_mem} | gold/scenario: {gold}",
         "",
-        "Mean±std over scenarios (main comparison pools scenarios across all seeds before "
-        "computing mean/std; remaining ablations use seed[0] only). `root_rank` = mean rank of "
-        "the root-cause memory (lower better). The mechanism under test is the real "
-        "`api.memory.tcmf.TCMFRetriever`; baselines and fusion variants share identical episodic "
-        "scores and causal boosts.",
+        "Mean [95% bootstrap CI] over scenarios (pooled across all seeds; 10000 resamples, "
+        "seed 0 - N02). `root_rank` = mean rank of the root-cause memory (lower better). The "
+        "mechanism under test is the real `api.memory.tcmf.TCMFRetriever`; baselines and "
+        "fusion variants share identical episodic scores and causal boosts.",
         "",
         _table("Main comparison", main, MAIN_ORDER), "",
-        "\n".join(seed_tbl), "",
+        significance, "",
         "\n".join(rand_tbl), "",
+        *([("\n".join(seed_tbl_lines)), ""] if seed_tbl_lines else []),
         _table("Ablation: fusion operator (F3/F4)", fusion), "",
         _table("Ablation: additive causal weight lambda", lam_ab), "",
         _table("Ablation: causal_sim_threshold", thr_ab), "",
@@ -244,21 +317,25 @@ async def run(args) -> None:
     (out_dir / "RESULTS.md").write_text("\n".join(md), encoding="utf-8")
 
     def _ser(d):
-        return {nm: {k: {"mean": v[0], "std": v[1]} for k, v in agg.items()}
+        return {nm: {k: {"mean": v[0], "ci_lo": v[1], "ci_hi": v[2]} for k, v in agg.items()}
                 for nm, agg in d.items()}
     (out_dir / "results.json").write_text(json.dumps({
-        "config": vars(base), "n": n, "seeds": seeds, "pool_size": pool_size,
-        "analytic_random_recall": analytic_random,
-        "main": _ser(main),
-        "per_seed": {str(s): _ser(a) for s, a in per_seed_agg.items()},
-        "fusion": _ser(fusion), "lambda": _ser(lam_ab),
+        "config": vars(base), "n": n, "seeds": seeds, "multiseed": multiseed,
+        "seed_stride": SEED_STRIDE if multiseed else None,
+        "n_total_scenarios": n_total, "pool_size": pool_size,
+        "analytic_random_recall": analytic_random, "empirical_random_recall": empirical_random,
+        "seed_stability_recall_at_10": seed_stability,
+        "main": _ser(main), "fusion": _ser(fusion), "lambda": _ser(lam_ab),
         "threshold": _ser(thr_ab), "depth": _ser(depth_ab),
         "difficulty": {a: _ser(v) for a, v in diff_rows.items()},
+        "significance_tcmf_add_vs_all": significance,
     }, indent=2), encoding="utf-8")
 
     print(_table("Main comparison", main, MAIN_ORDER).replace("### ", "== "))
-    print("\n" + "\n".join(seed_tbl).replace("### ", "== "))
+    print("\n" + significance.replace("### ", "== "))
     print("\n" + "\n".join(rand_tbl).replace("### ", "== "))
+    if seed_tbl_lines:
+        print("\n" + "\n".join(seed_tbl_lines).replace("### ", "== "))
     print("\n" + _table("Fusion operator", fusion).replace("### ", "== "))
     print("\n" + "\n".join(diff_tbl).replace("### ", "== "))
     print(f"\nWrote {out_dir/'RESULTS.md'} and {out_dir/'results.json'}")
@@ -268,14 +345,15 @@ def parse_args():
     p = argparse.ArgumentParser(description="TCMF benchmark runner")
     p.add_argument("--n", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--seeds", type=str, default=None,
-                    help="comma-separated base seeds, e.g. '0,1,2,3,4'; overrides --seed and "
-                         "pools the main comparison's per-scenario rows across all of them")
-    p.add_argument("--n-distractors", type=int, default=None,
-                    help="override GenConfig.n_distractors (default 6)")
-    p.add_argument("--n-noise", type=int, default=None,
-                    help="override GenConfig.n_noise (default 8)")
     p.add_argument("--out", type=str, default="results")
+    p.add_argument("--n-distractors", type=int, default=None,
+                    help="override GenConfig.n_distractors (default: GenConfig's own default)")
+    p.add_argument("--n-noise", type=int, default=None,
+                    help="override GenConfig.n_noise (default: GenConfig's own default)")
+    p.add_argument("--seeds", type=str, default=None,
+                    help="comma-separated base seeds for a multi-seed harness (N01), e.g. "
+                         "'0,1,2,3,4'. Each seed is offset by SEED_STRIDE and its scenarios "
+                         "pooled into the reported means. Overrides --seed when set.")
     return p.parse_args()
 
 

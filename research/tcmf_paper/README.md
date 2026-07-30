@@ -21,6 +21,7 @@ tcmfbench/
   methods.py      baselines (random, recency, semantic RAG, episodic, causal-only, graph PPR)
                   + real TCMF retriever + additive / RRF / multiplicative operator variants
   metrics.py      recall@k, root-cause MRR/rank, nDCG@k
+  stats.py        bootstrap CIs + paired Wilcoxon signed-rank + Holm-Bonferroni (pure numpy)
   run_eval.py     pure regime: main comparison + ablations -> results_main/
   run_mixed.py    mixed regime: fusion beats single signals + dropout -> results_mixed/
   run_realtext.py real-text tier (needs Ollama) -> results_realtext/
@@ -47,6 +48,33 @@ Outputs `RESULTS*.md` (tables) and `results*.json` (raw) per run. Synthetic runs
 seconds and are deterministic given `--seed`. The real-text tier needs Ollama running with
 `nomic-embed-text`; it embeds each unique sentence once and caches to
 `results_realtext/emb_cache.json`, so only the first run is slow.
+
+### Realistic pool size + multi-seed harness (N01)
+
+`run_eval.py` and `run_mixed.py` also accept `--n-distractors`, `--n-noise`, and `--seeds`
+(comma-separated base seeds, e.g. `0,1,2,3,4`) to rerun any of the above at a larger candidate
+pool, pooled across multiple disjoint seeds:
+
+```powershell
+& "..\..\.venv\Scripts\python" -m tcmfbench.run_eval  --n 300 --seeds 0,1,2,3,4 --n-distractors 20 --n-noise 55 --out results_main_scale
+& "..\..\.venv\Scripts\python" -m tcmfbench.run_mixed --n 300 --seeds 0,1,2,3,4 --n-distractors 20 --n-noise 55 --out results_mixed_scale
+```
+
+Omitting all three flags reproduces the original small-pool, single-seed numbers bit-for-bit
+(verified). See `FINDINGS.md` (N01) for what changes at the larger, more realistic pool - it is
+a mixed result, not a clean win. `tcmfbench/test_n01_scale.py` unit-tests the analytic random
+baseline and the seed-disjointness / no-pool-recap invariants this harness relies on.
+
+### Confidence intervals + paired significance tests (N02)
+
+Every `RESULTS*.md` table cell is `mean [95% bootstrap CI]` (seeded percentile bootstrap,
+10000 resamples, `tcmfbench/stats.py`), and the main comparison table is followed by a paired
+Wilcoxon signed-rank significance table (`tcmf_add` vs every other method, Holm-Bonferroni
+corrected across the family). See `FINDINGS.md` (N02) for what this settles: a previously
+unflagged significant recall@5 loss to `graph_ppr` in the mixed regime, and why N01's
+recall@10 "tie" at the realistic pool is statistically significant but practically negligible.
+`tcmfbench/test_stats.py` unit-tests the bootstrap CI, Wilcoxon, and Holm-Bonferroni functions
+against hand-computed known answers.
 
 ## What the benchmark holds fixed vs varies
 
