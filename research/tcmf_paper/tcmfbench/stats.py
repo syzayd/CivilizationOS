@@ -114,6 +114,44 @@ def wilcoxon_signed_rank(a, b) -> float:
     return min(p, 1.0)
 
 
+def _norm_ppf(p: float, tol: float = 1e-12) -> float:
+    """Inverse of `_norm_cdf` via bisection - the standard-normal quantile function, computed
+    from the same error-function primitive `_norm_cdf` uses rather than a hardcoded z-table
+    constant, so it is not a "number that was not produced by a committed script"."""
+    lo, hi = -10.0, 10.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if _norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return (lo + hi) / 2.0
+
+
+def wilson_ci(successes: int, n: int, alpha: float = 0.05) -> tuple[float, float, float]:
+    """Wilson score confidence interval for a binomial proportion. Returns
+    ``(phat, lo, hi)``. Used where only the aggregate (successes, n) of a Bernoulli-outcome
+    metric is available - e.g. a committed `mean [+/- std]` accuracy figure with a known n but
+    no surviving per-scenario array to bootstrap over (`bootstrap_ci` needs the raw values;
+    this needs only the count). Unlike the normal (Wald) interval, Wilson stays inside [0, 1]
+    and is well-behaved near p=0 or p=1, which is exactly where a small-n accuracy figure
+    tends to sit.
+    """
+    if n <= 0:
+        return float("nan"), float("nan"), float("nan")
+    phat = successes / n
+    z = _norm_ppf(1.0 - alpha / 2.0)
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (phat + z2 / (2 * n)) / denom
+    half = (z * math.sqrt(phat * (1 - phat) / n + z2 / (4 * n * n))) / denom
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return phat, lo, hi
+
+
 def holm_bonferroni(pvalues) -> list[float]:
     """Holm step-down adjusted p-values (family-wise, less conservative than plain
     Bonferroni). Returns adjusted p-values in the same order as the input; a contrast is

@@ -265,7 +265,22 @@ width, and that Fig 1's node labels match the scenario JSON it was generated fro
 that every plotted additive crossing really does fall below its drawn bound.
 
 ### N11 - Fig 5 (graph degradation) + Fig 6 (decision accuracy)
-**Status:** OPEN | **Env:** CLOUD-OK
+**Status:** DONE (2026-08-06) | **Env:** CLOUD-OK
+
+**Residual, found and left for a human/LOCAL-ONLY night, not fixed tonight:** `results_decision.json`
+only ever stored `mean`/`std` (no raw per-scenario array), so Fig 6's CIs are Wilson score
+intervals computed from `(round(mean*n), n)` (`stats.wilson_ci`, new, unit-tested), not N02
+bootstrap CIs over raw data - documented in the figure's own committed `fig6_decision_ci.json`
+and in NIGHT_LOG.md. A real bootstrap would need either a raw-array-emitting rerun of
+`run_decision.py` (needs Ollama, LOCAL-ONLY) or a code change to persist per-scenario
+correctness going forward. Separately: attempting to rerun `run_decision.py`/`run_realtext.py`
+offline via their existing caches now fails - `realtext.py`'s domain selection is
+`rng.integers(len(DOMAINS))`, and N05 grew `DOMAINS` from 6 to 8, which silently changes what
+every seed draws (confirmed: `default_rng(0).integers(6)` and `default_rng(0).integers(8)`
+diverge from the very first call). `results_realtext`/`results_decision`'s REPRODUCE.md commands
+are therefore not actually offline-reproducible as claimed until this is fixed (a `domain_idx`
+pinning fix, or deliberately re-scoping to 8 domains with a fresh Ollama-backed regeneration) -
+flagged in REPRODUCE.md, not silently patched.
 
 - **Fig 5:** degradation under edge dropout *and* the N04 spurious-edge rate, with CI bands
   and the semantic floor drawn as a reference line.

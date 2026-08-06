@@ -36,8 +36,9 @@ tcmfbench/
   run_theory.py   measures the propositions on real scenarios (N15) -> results_theory/
   run_lambda_sweep.py  recall@5 vs lambda, both operators, one grid (N10) -> results_lambda_sweep/
 figures/          Fig 1 (causal graph) + Fig 2 (retrieval pipeline), N09; Fig 3 (fusion
-                  operator margin) + Fig 4 (recall vs lambda), N10; make_figures.py regenerates
-                  all four from committed data, never hand-drawn/hand-typed
+                  operator margin) + Fig 4 (recall vs lambda), N10; Fig 5 (graph degradation) +
+                  Fig 6 (decision accuracy), N11; make_figures.py regenerates all six from
+                  committed data, never hand-drawn/hand-typed
 PAPER_PLAN.md     the correct framing, related work, and phase plan
 FINDINGS.md       what the runs show (read this first): F1-F7 + code fixes + real-text tier
 ```
@@ -195,6 +196,43 @@ lambda~0.3 (shaded) and then rises, reaching 0.52 at the N03 tune-selected value
 so the figure does not imply multiplicative fusion is flat everywhere, only that a small-lambda
 sweep would never find the fix. `tcmfbench/test_n10_figures.py` (15 tests) checks both against
 the real theory functions and the committed result JSON, not hand-typed numbers.
+
+### Fig 5 (graph degradation) + Fig 6 (decision accuracy) (N11)
+
+Same `figures/make_figures.py` command as above also produces these two.
+
+Fig 5 draws entirely from the already-committed `results_spurious/results_spurious.json` (N04) -
+no new experiment. Top panel: recall@10 vs spurious false-ancestor rate (edge dropout=0) for
+`semantic_rag`/`causal_only`/`graph_ppr`/`tcmf_add`/`tcmf_shipped` with N02 bootstrap CI bands;
+the semantic floor is drawn as its own flat curve rather than a single reference line so it
+carries the same CI treatment as everything else. Bottom panels: three small heatmaps of the
+coarser 2-D (edge dropout x spurious rate) grid for `semantic_rag`/`causal_only`/`tcmf_add` (the
+three methods that grid covers), point estimates only (n=100/cell, as N04 computed it - no CI
+data exists at that resolution).
+
+Fig 6 needs a CI for `results_decision/results_decision.json`'s per-method decision accuracy
+(n=60), but that file stores only `mean`/`std`, never a raw per-scenario array - and the
+decision experiment needs Ollama, so a cloud sandbox cannot rerun it to get one. Since
+`decision_acc` is a Bernoulli mean over a *known* n, the exact success count is recoverable
+(`round(mean * n)`, asserted to be within float noise of an integer), and `stats.wilson_ci` (new
+this night, pure numpy/`math.erf`, no scipy) gives a real Wilson score interval from that count -
+not a bootstrap CI, and the figure's own committed `figures/fig6_decision_ci.json` says so
+explicitly. `tcmfbench/test_n11_figures.py` checks Fig 5's numbers are read verbatim from
+`results_spurious.json` (not transcribed), that `tcmf_add` never crosses below `semantic_rag`
+up to p=0.4 (matching N04's own finding), and that Fig 6's success-count recovery is exact and
+raises rather than silently mis-applying the CI if a future metric is not a simple Bernoulli
+mean.
+
+**Honest side-finding from building Fig 6, not previously visible in the mean/std-only
+`RESULTS_DECISION.md` table:** `tcmf_shipped`'s Wilson CI ([0.89, 0.99]) does not overlap
+`graph_ppr`'s ([0.66, 0.87]) at all, but the three "causal leaders" - `causal_only` ([0.74,
+0.92]), `tcmf_add` ([0.72, 0.91]), `tcmf_shipped` - have CIs that all overlap each other and
+`graph_ppr`'s upper bound clears `causal_only`'s and `tcmf_add`'s lower bounds too. Non-overlapping
+CIs is a conservative heuristic, not a formal paired significance test (that would need the raw
+per-scenario array N02's machinery expects, unavailable here), so this is reported as a
+qualitative caution, not a new significance claim: at n=60, decision accuracy alone cannot
+cleanly separate `causal_only`/`tcmf_add`/`graph_ppr` from each other, only `tcmf_shipped` stands
+clearly apart from `graph_ppr` specifically.
 
 ## What the benchmark holds fixed vs varies
 

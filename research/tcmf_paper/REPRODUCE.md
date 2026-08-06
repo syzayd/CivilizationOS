@@ -25,6 +25,7 @@ a bug per the standing rule in `NIGHT_QUEUE.md` - find its source or delete the 
 | `results_theory` | `python -m tcmfbench.run_theory --out results_theory` | seconds | none |
 | `results_lambda_sweep` | `python -m tcmfbench.run_lambda_sweep --n 300 --n-seeds 5 --out results_lambda_sweep` | ~2 min | none - the script itself asserts its own lambda=0.6/8 (mult) and lambda=4 (additive) points reproduce `results_main_scale/results.json` to machine precision before writing output |
 | `figures/fig1_*`, `figures/fig2_*`, `figures/fig3_*`, `figures/fig4_*` | `python figures/make_figures.py --out figures` (needs `pip install -r requirements-bench.txt`; Fig 4 needs `results_lambda_sweep/` to already exist, else it is skipped with a printed message) | seconds | `figures/fig1_scenario.json`, `figures/fig3_pairs.json` (both committed; regenerated fresh each run - deterministic modulo the memory-id-string caveat in `tcmfbench/test_n10_figures.py::_strip_ids`, so every *numeric* field reproduces bit-for-bit even though `root_id`/`distractor_id` strings can shift between process invocations) |
+| `figures/fig5_*`, `figures/fig6_*` | same `python figures/make_figures.py --out figures` command (N11); Fig 5 needs `results_spurious/` to already exist (see below), Fig 6 needs `results_decision/` to already exist (needs Ollama, see below) - each is skipped with a printed message if its input is missing | seconds | `figures/fig6_decision_ci.json` (committed; the Wilson-CI derivation of Fig 6's error bars from `results_decision.json`'s stored mean/n - see the caveat under "Decision-quality tier" below) |
 
 **Checked, not a bug, but not bit-identical either:** running the documented command fresh
 against the current codebase reproduces `results_main_scale`/`results_mixed_scale` exactly
@@ -47,11 +48,39 @@ is the one the paper actually draws from.
 | `results_realtext` | `python -m tcmfbench.run_realtext --n 120 --out results_realtext` | first run: several min (encoder-bound); reruns: seconds | `results_realtext/emb_cache.json` (committed) |
 | `results_n06` | `python -m tcmfbench.run_n06_domains --out results_n06` | first run: tens of min (200 scenarios to embed + ~1,200 local LLM calls for the decision tier); reruns: seconds | extends `results_realtext/emb_cache.json` and `results_decision/llm_cache.json` (both committed) |
 
+**Discovered 2026-08-06 (N11), not fixed, "reruns: seconds" above is currently FALSE for a
+fresh process:** `realtext.generate_realtext`'s domain pick is `rng.integers(len(DOMAINS))`
+when `domain_idx` is not pinned (`run_realtext.py` and `run_decision.py` both call it that way;
+only `run_n06_domains.py` pins `domain_idx` per domain and is unaffected). N05 (2026-08-04) grew
+`DOMAINS` from 6 to 8 entries. A same-seeded `numpy.random.Generator.integers` call with a
+different upper bound draws a different value from its very first call (confirmed directly:
+`np.random.default_rng(0).integers(6)` and `np.random.default_rng(0).integers(8)` diverge), so
+every scenario `run_realtext`/`run_decision` would generate today at any given seed differs from
+what generated the currently-committed `results_realtext`/`results_decision` (both predate N05).
+Concretely: attempting `python -m tcmfbench.run_decision --n 60 --out results_decision` in a
+cloud sandbox with only the committed caches now fails with `RuntimeError: ... text not cached`
+partway through, because it requests embeddings for scenarios the committed
+`results_realtext/emb_cache.json` never saw. This does not invalidate the committed results
+(each is still internally consistent and was itself produced by the exact command in its own
+result directory, before N05 landed) - it means the command as written cannot be blindly re-run
+today and expected to reproduce or extend them without either (a) pinning `domain_idx` to a
+round-robin over 8 domains and accepting a *different*, not-bit-compatible committed artifact
+after a fresh Ollama-backed regeneration, or (b) restricting the rerun to the original 6 domains
+explicitly. Not fixed tonight: fixing it well is a judgment call on which domain set future runs
+should use, and any regeneration needs Ollama (LOCAL-ONLY).
+
 ## Decision-quality tier (needs Ollama: `qwen2.5:3b-instruct`)
 
 | Result dir | Command | ~Runtime | Cache |
 |---|---|---|---|
-| `results_decision` | `python -m tcmfbench.run_decision --n 60 --out results_decision` | first run: a few min (60 x 10 = 600 LLM calls); reruns: seconds | `results_decision/llm_cache.json` (committed) |
+| `results_decision` | `python -m tcmfbench.run_decision --n 60 --out results_decision` | first run: a few min (60 x 10 = 600 LLM calls); reruns: seconds, EXCEPT see the domain-determinism caveat directly above - a fresh rerun currently cannot complete offline | `results_decision/llm_cache.json` (committed) |
+
+**Note for Fig 6 (N11):** `results_decision.json` stores only `mean`/`std` per method, not a raw
+per-scenario correctness array, so there is nothing for `stats.bootstrap_ci` to resample. Fig 6's
+error bars are Wilson score intervals (`stats.wilson_ci`, new in N11) computed from
+`(round(mean * n), n)` instead - exact given the known n, pure numpy/`math.erf`, no scipy, and
+not the same procedure as every other figure/table's bootstrap CI. `figures/fig6_decision_ci.json`
+records this explicitly per method.
 
 ## LoCoMo public-benchmark check (N18, needs Ollama for embedding)
 
@@ -61,10 +90,9 @@ is the one the paper actually draws from.
 
 ## Not yet regenerable (open NIGHT_QUEUE.md items as of this writing)
 
-N11 (remaining figures), N12 (ablation), N13 (second encoder + latency), N16 (scale/
-multi-crisis stress), N17 (TCMFBench spinoff) have no committed result artifact yet - their
-rows will be added to this file the day each lands, not before. Do not cite a number for any
-of these; none exists.
+N12 (ablation), N13 (second encoder + latency), N16 (scale/multi-crisis stress), N17
+(TCMFBench spinoff) have no committed result artifact yet - their rows will be added to this
+file the day each lands, not before. Do not cite a number for any of these; none exists.
 
 ## Structural validation (LaTeX draft, private repo)
 

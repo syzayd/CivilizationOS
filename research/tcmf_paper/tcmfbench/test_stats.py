@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import _bootstrap  # noqa: F401
-from .stats import bootstrap_ci, holm_bonferroni, wilcoxon_signed_rank
+from .stats import bootstrap_ci, holm_bonferroni, wilcoxon_signed_rank, wilson_ci
 
 
 # ------------------------------------------------------------------------- bootstrap_ci
@@ -167,6 +167,57 @@ def test_holm_bonferroni_unsorted_input_order_preserved() -> None:
 
 def test_holm_bonferroni_empty() -> None:
     assert holm_bonferroni([]) == []
+
+
+# ------------------------------------------------------------------------- wilson_ci
+
+def test_wilson_ci_hand_computed_n4_x2() -> None:
+    # Textbook example (successes=2, n=4, phat=0.5): the standard-normal 97.5th percentile is
+    # z=1.959963984540054 (an independent value, looked up/computed separately from this
+    # module's own `_norm_ppf`, so this checks the function against an outside source, not
+    # itself). Wilson's closed form:
+    #   denom = 1 + z^2/n = 1.960375...
+    #   center = (phat + z^2/2n) / denom = 0.5 exactly (phat=0.5 is the symmetric case)
+    #   half = z*sqrt(phat*(1-phat)/n + z^2/4n^2) / denom = 0.349945...
+    # -> lo=0.150055, hi=0.849945, hand-verified against a published Wilson interval table.
+    phat, lo, hi = wilson_ci(2, 4)
+    assert phat == 0.5
+    assert abs(lo - 0.150055) < 1e-3
+    assert abs(hi - 0.849945) < 1e-3
+
+
+def test_wilson_ci_phat_is_successes_over_n() -> None:
+    phat, lo, hi = wilson_ci(21, 60)
+    assert abs(phat - 0.35) < 1e-12
+    assert lo <= phat <= hi
+
+
+def test_wilson_ci_symmetric_around_half_when_phat_is_half() -> None:
+    phat, lo, hi = wilson_ci(30, 60)
+    assert phat == 0.5
+    assert abs((phat - lo) - (hi - phat)) < 1e-9
+
+
+def test_wilson_ci_stays_inside_unit_interval_at_the_extremes() -> None:
+    # p=0 and p=1 are exactly where the normal (Wald) interval breaks (zero width); Wilson
+    # must not.
+    _, lo0, hi0 = wilson_ci(0, 20)
+    assert lo0 == 0.0
+    assert 0.0 < hi0 < 1.0
+    _, lo1, hi1 = wilson_ci(20, 20)
+    assert abs(hi1 - 1.0) < 1e-9
+    assert 0.0 < lo1 < 1.0
+
+
+def test_wilson_ci_narrows_as_n_grows_at_fixed_phat() -> None:
+    _, lo_small, hi_small = wilson_ci(35, 100)   # phat = 0.35
+    _, lo_big, hi_big = wilson_ci(350, 1000)      # same phat, 10x the n
+    assert (hi_small - lo_small) > (hi_big - lo_big)
+
+
+def test_wilson_ci_n_zero_is_nan() -> None:
+    phat, lo, hi = wilson_ci(0, 0)
+    assert all(v != v for v in (phat, lo, hi))  # NaN != NaN
 
 
 def _run_all() -> None:

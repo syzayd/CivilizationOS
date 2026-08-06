@@ -1,0 +1,78 @@
+{
+  "controls": {
+    "no_retrieval": {
+      "ci_hi": 0.44233767026177323,
+      "ci_lo": 0.21305867552366137,
+      "mean": 0.31666666666666665,
+      "n": 60,
+      "successes": 19
+    },
+    "oracle": {
+      "ci_hi": 0.982850497835605,
+      "ci_lo": 0.8629948352365095,
+      "mean": 0.95,
+      "n": 60,
+      "successes": 57
+    }
+  },
+  "methods": {
+    "causal_only": {
+      "ci_hi": 0.9190255941983247,
+      "ci_lo": 0.738854109302209,
+      "mean": 0.85,
+      "n": 60,
+      "successes": 51
+    },
+    "episodic": {
+      "ci_hi": 0.3723207007704838,
+      "ci_lo": 0.15776522530056353,
+      "mean": 0.25,
+      "n": 60,
+      "successes": 15
+    },
+    "graph_ppr": {
+      "ci_hi": 0.8687695595180998,
+      "ci_lo": 0.6637997242680465,
+      "mean": 0.7833333333333333,
+      "n": 60,
+      "successes": 47
+    },
+    "semantic_rag": {
+      "ci_hi": 0.47637381158245684,
+      "ci_lo": 0.2416777440601715,
+      "mean": 0.35,
+      "n": 60,
+      "successes": 21
+    },
+    "tcmf_add": {
+      "ci_hi": 0.9068682302080877,
+      "ci_lo": 0.7196838683638491,
+      "mean": 0.8333333333333334,
+      "n": 60,
+      "successes": 50
+    },
+    "tcmf_mult": {
+      "ci_hi": 0.6226497575844473,
+      "ci_lo": 0.37735024241555276,
+      "mean": 0.5,
+      "n": 60,
+      "successes": 30
+    },
+    "tcmf_rrf": {
+      "ci_hi": 0.6690634559324523,
+      "ci_lo": 0.4249193588533383,
+      "mean": 0.55,
+      "n": 60,
+      "successes": 33
+    },
+    "tcmf_shipped": {
+      "ci_hi": 0.9908106807438026,
+      "ci_lo": 0.886362257256909,
+      "mean": 0.9666666666666667,
+      "n": 60,
+      "successes": 58
+    }
+  },
+  "n": 60,
+  "note": "Wilson score CI from (successes=round(mean*n), n) - results_decision.json stores only mean/std, not a raw per-scenario array to bootstrap over, and this cloud sandbox cannot rerun the Ollama-backed decision experiment."
+}

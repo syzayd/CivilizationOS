@@ -812,6 +812,85 @@ constant; the multiplicative curve is flat at low lambda and not flat by the top
 tuned-point annotation matches its own grid row. Full benchmark suite: 111 tests (96 pre-existing
 + 15 new), all green.
 
+## N11 - Fig 5 (graph degradation) + Fig 6 (decision accuracy)
+
+Both figures draw entirely from already-committed, already-tested data - no new experiment ran
+tonight, only the plotting code and (for Fig 6) one new statistic.
+
+**Fig 5** (`figures/make_figures.py`'s new `draw_fig5`, reading `results_spurious/
+results_spurious.json` from N04 verbatim): top panel is the recall@10-vs-spurious-rate curve
+(edge dropout=0) for `semantic_rag`/`causal_only`/`graph_ppr`/`tcmf_add`/`tcmf_shipped` with N02
+bootstrap CI bands - `semantic_rag` is drawn as its own flat curve (with its own, degenerate-width
+CI band, since its 300x5 pooled estimate barely moves) rather than a plain reference line, so the
+"floor" claim carries the same uncertainty treatment as every other line, not a special case.
+Bottom panels are three small heatmaps of N04's coarser 2-D (edge dropout x spurious rate) grid
+for the three methods it covers (`semantic_rag`/`causal_only`/`tcmf_add`) - point estimates only,
+since that grid was computed at n=100/cell with no CI. Confirms visually what N04 already found in
+table form: recall degrades monotonically and gracefully, `tcmf_add` never dips below the
+`semantic_rag` floor anywhere in the tested range (0 to p=0.4), and the two knobs (dropout,
+spurious rate) look roughly additive rather than compounding at this resolution.
+
+**Fig 6** (`draw_fig6` + new `build_fig6_ci`, reading `results_decision/results_decision.json`
+from the F8 decision tier): a bar chart of decision accuracy per method with error bars, plus the
+`no_retrieval` floor and `oracle` ceiling as horizontal reference lines. The complication:
+`results_decision.json` stores only `mean`/`std`, never a raw per-scenario correctness array, so
+there is nothing for `stats.bootstrap_ci` to resample, and the decision experiment needs Ollama -
+unreachable in this cloud sandbox. **New this night: `stats.wilson_ci(successes, n)`** (pure
+numpy + `math.erf`, no scipy, no hardcoded z-table constant - the standard-normal quantile is
+found by bisection against the module's own `_norm_cdf`), applied to `(round(mean * n), n)`
+recovered from the stored mean and the known n=60. `build_fig6_ci` asserts `mean * n` is within
+float noise of an integer for every method/control before trusting it - a guard against silently
+misapplying a binomial CI to a metric that is not actually a simple accuracy fraction. This is a
+Wilson score interval, not a bootstrap CI, and `figures/fig6_decision_ci.json` (committed) says so
+explicitly per method, so the difference in methodology from every other figure/table in this repo
+is never silently blurred.
+
+**Honest side-finding, only visible once real intervals replaced the mean+-std table:** at n=60,
+`tcmf_shipped`'s Wilson CI ([0.89, 0.99]) clears `graph_ppr`'s entirely ([0.66, 0.87]) - no
+overlap - but the three "causal leaders" overlap each other and `graph_ppr`: `causal_only` [0.74,
+0.92], `tcmf_add` [0.72, 0.91], and `graph_ppr`'s own upper bound (0.87) sits above both of their
+lower bounds. Non-overlapping CIs is a conservative visual heuristic, not a formal paired test (a
+real paired test needs the raw per-scenario array this file does not have), so this is reported as
+a qualitative caution rather than a new significance claim: **decision accuracy alone, at this
+n, cannot cleanly separate `causal_only`/`tcmf_add`/`graph_ppr` from each other - only
+`tcmf_shipped` stands clearly apart from `graph_ppr` specifically.** This narrows, slightly, F8's
+existing framing ("tcmf_shipped reaches 0.97, essentially the oracle ceiling... beats tcmf_add
+despite similar causal@5") - the beat over `tcmf_add` (0.97 vs 0.83) is visually large but the two
+methods' Wilson CIs still overlap at n=60, so "clearly beats" should be softened to "scores
+higher, with overlapping uncertainty at this sample size" until a proper paired test on raw
+decision outcomes is available (would need a LOCAL-ONLY rerun that persists per-scenario
+correctness, not built tonight - noted as a natural follow-up, not done).
+
+**Discovered, not fixed tonight, and flagged loudly in `REPRODUCE.md` rather than silently
+patched: `run_decision.py`/`run_realtext.py` are no longer offline-reproducible from their own
+committed caches.** Attempting to rerun `python -m tcmfbench.run_decision --n 60 --out
+results_decision` in this cloud sandbox (to get a raw array for a real bootstrap CI instead of
+Wilson) failed with `RuntimeError: ... text not cached`. Root cause, confirmed directly: N05
+(2026-08-04) grew `realtext.DOMAINS` from 6 to 8 entries; `generate_realtext`'s domain pick is
+`rng.integers(len(DOMAINS))` when `domain_idx` is not pinned, and a same-seeded
+`numpy.random.Generator.integers` call with a different upper bound diverges from its very first
+draw (`np.random.default_rng(0).integers(6)` != `np.random.default_rng(0).integers(8)`, verified
+in a Python shell). `run_n06_domains.py` pins `domain_idx` per domain and is unaffected;
+`run_realtext.py`/`run_decision.py` do not pin it and are. This is a real reproducibility
+regression introduced by N05, sitting undetected in `REPRODUCE.md`'s claim that these commands
+"rerun in seconds" - it does not invalidate the already-committed `results_realtext`/
+`results_decision` (both predate N05 and are internally consistent with the command that made
+them), but the command as currently written cannot regenerate or extend them today. Fixing it
+requires a judgment call (round-robin over all 8 domains going forward, accepting a fresh,
+not-bit-compatible artifact, vs. explicitly freezing at 6) plus an Ollama-backed regeneration
+either way - out of scope for a CLOUD-OK figures night, left for Zaid or a LOCAL-ONLY night.
+
+`tcmfbench/test_n11_figures.py` (11 tests): Fig 5's curve and grid values are read verbatim from
+`results_spurious.json` (not transcribed), `tcmf_add` is confirmed to never cross below
+`semantic_rag` up to p=0.4 (pinning N04's own finding so a future change would be caught), the
+p=0 curve and p=0 grid cells agree within the sampling noise expected from n=300 vs n=100; Fig 6's
+success-count recovery is exact for every method/control, the resulting CI always contains the
+point estimate, the wiring matches a direct `stats.wilson_ci` call, and a synthetic non-Bernoulli
+mean is confirmed to raise rather than silently produce a wrong interval. `stats.wilson_ci` itself
+has 6 dedicated tests in `test_stats.py`, including a hand-derived n=4/x=2 case cross-checked
+against an independently-looked-up z=1.959963984540054 (not the function's own bisection). Full
+benchmark suite: 128 tests (112 pre-existing + 5 `wilson_ci` + 11 `test_n11_figures`), all green.
+
 ## Still open before submission
 
 - **Write-up** (Phase 5) drafted (kept in a private repo); fold in the F8 decision tier + table,

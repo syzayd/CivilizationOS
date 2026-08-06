@@ -1392,3 +1392,155 @@ machine" caveat. Both closed. Not a queue item; run locally by Zaid's direction.
   `results_decision/` for Fig 6's `no_retrieval`/`oracle` reference lines), so it should be a
   pure plotting job reusing this session's and N09's `make_figures.py` scaffolding, not a new
   experiment.
+
+---
+
+## 2026-08-06 (N11 - Fig 5 graph degradation + Fig 6 decision accuracy)
+
+- **Item:** N11, the lowest-numbered OPEN + CLOUD-OK item (N01-N10 and N15/N18 already DONE;
+  N12/N13/N16/N17 are all higher-numbered and also OPEN, so N11 is next). Environment: cloud
+  sandbox, no Ollama, no access to Zaid's machine - LOCAL-ONLY items remain untouched, no
+  Ollama-backed number fabricated. Built the usual throwaway `.venv_ci` (Python 3.11, numpy,
+  networkx, pytest, matplotlib) at the repo root, since this repo ships no committed venv.
+  Baseline before touching anything: 112 benchmark tests green.
+- **What was built:**
+  - `tcmfbench/stats.py`: new `wilson_ci(successes, n, alpha=0.05)` and a helper `_norm_ppf`
+    (the standard-normal quantile via bisection against the module's own `_norm_cdf`, so no
+    hardcoded z-table constant enters the codebase - the same "computed, not typed in" posture
+    the rest of this module already follows). 6 new tests in `test_stats.py`: a hand-derived
+    n=4/x=2 case cross-checked against an independently-looked-up z=1.959963984540054 (not the
+    function's own internal bisection - a real outside check); `phat == successes/n` exactly;
+    symmetry around 0.5; both extremes (x=0, x=n) stay inside [0,1] without collapsing to zero
+    width (the specific failure mode Wilson exists to avoid, unlike the plain normal/Wald
+    interval); CI width shrinks as n grows at fixed phat; n=0 returns NaN cleanly.
+  - `figures/make_figures.py`: `draw_fig5` (top panel: recall@10 vs spurious-edge rate at
+    dropout=0 for `semantic_rag`/`causal_only`/`graph_ppr`/`tcmf_add`/`tcmf_shipped`, N02
+    bootstrap CI bands read straight from `results_spurious/results_spurious.json`'s already-
+    committed `curve` field; bottom panels: 3 small heatmaps of the 2-D dropout x spurious grid
+    for the 3 methods `grid_recall_at_10` covers) and `extract_fig5_curve` (a small pure
+    extraction helper so the figure and its test read the source JSON through the identical
+    code path, not two independently-written lookups that could silently drift). `draw_fig6` +
+    new `build_fig6_ci` (bar chart of decision accuracy per method with Wilson-CI error bars,
+    `no_retrieval`/`oracle` as horizontal reference lines) reading `results_decision/
+    results_decision.json`. Both write PDF+PNG; Fig 6 also writes a new committed
+    `figures/fig6_decision_ci.json` (the derived successes/n/CI per method, for provenance -
+    same pattern N09/N10 used for `fig1_scenario.json`/`fig3_pairs.json`).
+  - `tcmfbench/test_n11_figures.py` (11 tests, mirrors `test_n09_figures.py`/
+    `test_n10_figures.py`'s structure): Fig 5's curve and grid values are read verbatim from
+    `results_spurious.json` (equality-checked cell by cell, not eyeballed); `tcmf_add` is
+    pinned to never cross below `semantic_rag` up to p=0.4 (so a future change to either curve
+    that breaks N04's own finding fails a test, not just a caption); the p=0 curve (n=300) and
+    p=0 grid cell (n=100) are cross-checked to agree within 0.03 (different sample, same
+    underlying quantity - not expected to be bit-identical); Fig 6's `build_fig6_ci` is checked
+    to recover an exact integer `successes` for every method/control, produce a CI that always
+    contains the point estimate, match a direct `stats.wilson_ci` call (wiring, not just the
+    math already covered in `test_stats.py`), and **raise** on a synthetic non-Bernoulli mean
+    (0.31337 is not k/60 for any integer k) rather than silently emit a wrong interval; both
+    figures render to non-empty vector PDF (checked for the `%PDF` magic bytes) and PNG.
+- **The actual run:** `python figures/make_figures.py --out figures` - a few seconds, all six
+  figures (1-4 unchanged, 5-6 new) regenerate. Fig 1-4's PDFs came back byte-identical in
+  content but with different embedded PDF `CreationDate`/`ModDate` metadata (confirmed same
+  file size, `git diff --stat` showing binary-changed-same-size) - a known matplotlib PDF
+  backend behavior unrelated to tonight's change, reverted with `git checkout --` so this PR's
+  diff is exactly the new figures plus the source changes, not four unrelated metadata churns.
+  Full suite reran green: 128 tests (112 baseline + 6 `wilson_ci` + 11 `test_n11_figures`), 0
+  failures.
+- **What the numbers actually said (read from the committed `results_spurious/
+  results_spurious.json` and `results_decision/results_decision.json`, both already-existing,
+  already-tested files - tonight added no new experiment, only the plots and one new
+  statistic):**
+  - **Fig 5 confirms N04's own table in picture form, no surprises:** recall degrades
+    monotonically and gracefully as the spurious false-ancestor rate rises, `tcmf_add` never
+    dips below the `semantic_rag` floor anywhere in {0, 0.05, 0.1, 0.2, 0.4} (pinned by a unit
+    test now, not just prose), and the two stress knobs (edge dropout, spurious rate) look
+    close to additive rather than compounding at the grid's coarse resolution - exactly what
+    N04 already reported, now visible at a glance instead of only in a table.
+  - **Fig 6, HONEST SIDE-FINDING - not previously visible in the mean+-std-only
+    `RESULTS_DECISION.md` table, and it narrows part of F8's framing.** Computing real
+    intervals (Wilson, from the known n=60 and each method's stored mean) shows
+    `tcmf_shipped`'s CI ([0.886, 0.991]) does not overlap `graph_ppr`'s ([0.664, 0.869]) at
+    all - a clean separation - but `causal_only` ([0.739, 0.919]), `tcmf_add` ([0.720, 0.907]),
+    and `graph_ppr` all overlap each other (`graph_ppr`'s upper bound 0.869 sits above both
+    `causal_only`'s and `tcmf_add`'s lower bounds). Non-overlapping CIs is a conservative
+    visual heuristic, not a formal paired significance test (a real one needs the raw
+    per-scenario array this file does not have - see the caveat below), so I am reporting this
+    as a qualitative caution, not a new significance claim: **at n=60, decision accuracy alone
+    cannot cleanly separate `causal_only`/`tcmf_add`/`graph_ppr` from each other; only
+    `tcmf_shipped` stands clearly apart from `graph_ppr` specifically.** This means F8's
+    existing sentence "`tcmf_shipped` (0.97) beats `tcmf_add` (0.83) despite similar causal@5"
+    is visually true but should not be read as a resolved statistical difference at this
+    sample size - the two methods' Wilson CIs overlap. I did not retune, resample, or drop this
+    finding to keep F8's framing cleaner; it is written down plainly here and in FINDINGS.md.
+  - **Methodological limitation, stated plainly rather than smoothed over: Fig 6's CI is a
+    Wilson score interval, not the bootstrap CI every other figure/table in this repo uses.**
+    `results_decision.json` was written (by an earlier, LOCAL-ONLY night) with only `mean`/
+    `std` per method, never a raw per-scenario correctness array, so `stats.bootstrap_ci` has
+    nothing to resample. Since `decision_acc` is a Bernoulli mean over a *known* n=60, the exact
+    success count is recoverable (`round(mean * 60)`) and Wilson gives a real, non-fabricated
+    interval from that count alone - `build_fig6_ci` asserts the recovered count reproduces the
+    stored mean to within float noise before trusting it, specifically so this does not
+    silently misfire if a future metric fed through the same code path is not actually a simple
+    accuracy fraction. This is disclosed in three places on purpose (the figure's own committed
+    `fig6_decision_ci.json`, `README.md`, `FINDINGS.md`) so nobody mistakes it for the same
+    procedure as Fig 4/5's bootstrap bands.
+  - **Discovered, investigated, NOT fixed tonight - a real reproducibility regression in
+    `run_decision.py`/`run_realtext.py`, found while trying (and failing) to get Fig 6 a real
+    bootstrap CI instead of Wilson.** Attempted `python -m tcmfbench.run_decision --n 60 --out
+    results_decision_test_offline` against the committed caches, expecting it to run fully
+    offline per `REPRODUCE.md`'s own claim ("reruns: seconds"). It raised `RuntimeError: Ollama
+    unreachable and text not cached` partway through embedding. Traced the root cause directly,
+    not guessed: `realtext.generate_realtext`'s domain pick is `rng.integers(len(DOMAINS))`
+    when `domain_idx` is not pinned; `run_decision.py`/`run_realtext.py` both call it that way,
+    while `run_n06_domains.py` pins `domain_idx` per domain and is the only one of the three
+    unaffected. N05 (2026-08-04) grew `DOMAINS` from 6 to 8 entries (appended at the end, so
+    existing indices 0-5 are unchanged in *content*, but the RNG call's bound changed). Verified
+    directly in a Python shell that this actually changes the draw: `numpy.random.default_rng
+    (0).integers(6)` returns 5, `numpy.random.default_rng(0).integers(8)` returns 6, from the
+    identical seed - bounded integer draws consume the generator's state differently depending
+    on the bound, so every downstream random call in that scenario's generation diverges too,
+    not just the domain choice. This means `results_decision`/`results_realtext` (both
+    committed before N05 landed) are still internally valid and reproducible from *their own
+    era*, but the command in `REPRODUCE.md` cannot regenerate or extend them today, and this
+    was previously undetected - nobody had tried an offline rerun since N05 landed. Did not
+    attempt a fix: the right fix (pin `domain_idx` to a deterministic round-robin over all 8
+    domains going forward vs. explicitly freeze at 6) is a scope decision, not a mechanical
+    patch, and either way needs a fresh Ollama-backed regeneration to produce a new, committed,
+    bit-compatible artifact - out of scope for a CLOUD-OK figures night. Documented in
+    `REPRODUCE.md` under both the real-text and decision-quality tiers, and in `NIGHT_QUEUE.md`
+    (N11's own residual note) and `FINDINGS.md`, not silently patched around or left
+    undiscoverable in a diff nobody will read.
+- **Verified vs assumed:** verified - all 128 tests pass (`python -m pytest tcmfbench`, and
+  `test_n11_figures.py`/`test_stats.py` also run directly via `python -m tcmfbench.test_*`,
+  matching this repo's dual-invocation convention); every Fig 5/Fig 6 number is read
+  programmatically from the committed source JSON inside the figure-drawing functions
+  themselves, not retyped by hand (checked by the extraction-helper equality tests); the
+  domain-determinism regression was verified by direct reproduction in a Python shell (shown
+  above), not inferred from the stack trace alone; both figures were rendered to PNG and looked
+  at (attached-quality check: legible at the committed size, colorblind-safe Okabe-Ito-derived
+  palette reused from N09/N10, heatmap panels share a y-axis so tick labels do not repeat three
+  times). Not assumed / still open: a real bootstrap CI for the decision tier (needs a
+  LOCAL-ONLY rerun of `run_decision.py` modified to persist a raw per-scenario array, not built
+  tonight); whether the Fig 6 CI-overlap nuance changes once that real bootstrap CI exists
+  instead of Wilson's normal-approximation-based interval; whether the domain-determinism
+  regression should be fixed by freezing at 6 domains or extending to 8 (Zaid's call).
+- **Private paper repo:** `syzayd/tcmf-paper` cloned successfully this session (unlike some
+  earlier nights, the clone worked) and one commit pushed directly to `main`
+  (`69bf263`, "N11: record Fig 5/6 landing, Wilson-CI caveat, and the N05
+  domain-determinism finding"): updated `REVIEW.md`'s "still genuinely open" paragraph (all six
+  figures now exist, not placed in `main.tex` yet), added the Wilson-vs-bootstrap-CI caveat for
+  Fig 6's eventual caption, the CI-overlap nuance on F8's "tcmf_shipped beats tcmf_add" sentence,
+  and a pointer to the domain-determinism finding for whoever runs N06/N13/N16's real-text
+  reruns next. Did not touch `main.tex` directly - placing figures into the draft with real
+  captions/labels/cross-references is a layout/prose pass, explicitly flagged as still open, not
+  a mechanical rerun. No draft paper prose was pasted into this public repo.
+- **Files touched (public repo):** `tcmfbench/stats.py` (added `wilson_ci`/`_norm_ppf`),
+  `tcmfbench/test_stats.py` (6 new tests), `figures/make_figures.py` (added `draw_fig5`/
+  `extract_fig5_curve`/`build_fig6_ci`/`draw_fig6` + CLI wiring), `tcmfbench/
+  test_n11_figures.py` (new, 11 tests), `figures/fig5_graph_degradation.pdf`/`.png` (new),
+  `figures/fig6_decision_accuracy.pdf`/`.png` (new), `figures/fig6_decision_ci.json` (new),
+  `FINDINGS.md`, `README.md`, `REPRODUCE.md`, `NIGHT_QUEUE.md` (N11 -> DONE).
+- **Next:** N12 (leave-one-out ablation of the four shipped fixes) is next in queue order and is
+  CLOUD-OK - a pure-synthetic-tier experiment, no new infrastructure blockers. Whoever picks up
+  the real-text tier again first (N13's second encoder, or a retry of N06/N07's baselines on
+  real text) should read tonight's domain-determinism finding before assuming `run_realtext.py`
+  reruns cleanly.

@@ -39,6 +39,7 @@ from tcmfbench.generator import GenConfig, generate
 from tcmfbench import methods as M
 from tcmfbench import theory as T
 from tcmfbench.mixed import MixedConfig, generate_mixed
+from tcmfbench import stats as S
 
 # Okabe-Ito colorblind-safe palette.
 COLOR_CAUSAL = "#0072B2"      # blue - causal-chain events / their witness memories
@@ -74,6 +75,28 @@ FIG3_LAMBDA_MAX = 11.0
 COLOR_MULT = "#CC79A7"     # reddish-purple - multiplicative fusion
 COLOR_ADD = "#0072B2"      # blue - additive fusion (reuse COLOR_CAUSAL's hue)
 COLOR_UNREACHABLE = "#D55E00"  # vermillion - the one scope-limited (boost-defect) pair
+
+# ------------------------------------------------------------------------- Fig 5/6 (N11)
+
+COLOR_SEMANTIC = "#999999"     # grey - the semantic-only floor, never touches the graph
+COLOR_CAUSAL_ONLY = "#56B4E9"  # sky blue - causal-signal-only oracle
+COLOR_GRAPH_PPR = "#009E73"    # bluish green - strongest structured baseline
+COLOR_SHIPPED = "#000000"      # black - the real, deployed retriever
+
+FIG5_CURVE_METHODS = ["semantic_rag", "causal_only", "graph_ppr", "tcmf_add", "tcmf_shipped"]
+FIG5_CURVE_COLORS = {
+    "semantic_rag": COLOR_SEMANTIC, "causal_only": COLOR_CAUSAL_ONLY,
+    "graph_ppr": COLOR_GRAPH_PPR, "tcmf_add": COLOR_ADD, "tcmf_shipped": COLOR_SHIPPED,
+}
+FIG5_GRID_METHODS = ["semantic_rag", "causal_only", "tcmf_add"]  # the 3 run_spurious grids
+
+FIG6_METHOD_ORDER = ["semantic_rag", "episodic", "causal_only", "graph_ppr",
+                      "tcmf_mult", "tcmf_add", "tcmf_shipped", "tcmf_rrf"]
+FIG6_METHOD_COLORS = {
+    "semantic_rag": COLOR_SEMANTIC, "episodic": "#E69F00", "causal_only": COLOR_CAUSAL_ONLY,
+    "graph_ppr": COLOR_GRAPH_PPR, "tcmf_mult": COLOR_MULT, "tcmf_add": COLOR_ADD,
+    "tcmf_shipped": COLOR_SHIPPED, "tcmf_rrf": "#F0E442",
+}
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -395,6 +418,161 @@ def draw_fig4(sweep: dict, out_stub: Path) -> None:
     plt.close(fig)
 
 
+# ------------------------------------------------------------------------- Fig 5 (N11)
+#
+# Both panels read straight from the already-committed, already-tested
+# `results_spurious/results_spurious.json` (N04) - no new experiment, no hand-typed numbers.
+# Top panel: the 1-D curve (edge_dropout=0, spurious_edge_rate swept) with N02 bootstrap CI
+# bands, already stored per-rate in `curve`. Bottom panels: the coarser 2-D
+# (edge_dropout x spurious_edge_rate) grid as three small heatmaps - `grid_recall_at_10` has
+# no CI (n=100/cell, point estimates only, exactly as N04 computed and reported it).
+
+def extract_fig5_curve(spurious: dict, method: str, metric: str = "recall@10"):
+    """Return (rates, mean, lo, hi) for one method's curve, read verbatim from the committed
+    JSON - used by both `draw_fig5` and its test so the two can be checked against each other."""
+    rates = spurious["spurious_rates"]
+    mean = [spurious["curve"][str(r)][method][metric]["mean"] for r in rates]
+    lo = [spurious["curve"][str(r)][method][metric]["ci_lo"] for r in rates]
+    hi = [spurious["curve"][str(r)][method][metric]["ci_hi"] for r in rates]
+    return rates, mean, lo, hi
+
+
+def draw_fig5(spurious: dict, out_stub: Path) -> None:
+    dropout_rates = spurious["dropout_rates_2d"]
+    spurious_rates_2d = spurious["spurious_rates"]
+
+    fig = plt.figure(figsize=(6.6, 5.0))
+    gs = fig.add_gridspec(2, len(FIG5_GRID_METHODS), height_ratios=[1.35, 1.0], hspace=0.55,
+                           wspace=0.15)
+    ax_curve = fig.add_subplot(gs[0, :])
+
+    for name in FIG5_CURVE_METHODS:
+        rates, mean, lo, hi = extract_fig5_curve(spurious, name)
+        color = FIG5_CURVE_COLORS[name]
+        ax_curve.plot(rates, mean, color=color, lw=1.3, marker="o", markersize=3,
+                      label=name, zorder=3)
+        ax_curve.fill_between(rates, lo, hi, color=color, alpha=0.18, zorder=1, linewidth=0)
+
+    ax_curve.set_xlabel("spurious false-ancestor edge rate $p$ (edge dropout = 0)", fontsize=7.5)
+    ax_curve.set_ylabel("recall@10", fontsize=8.0)
+    ax_curve.set_ylim(-0.02, 1.05)
+    ax_curve.tick_params(labelsize=7.0)
+    ax_curve.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=6.5, frameon=False)
+    ax_curve.set_title(
+        "recall degrades monotonically; semantic_rag's floor is never crossed up to p=0.4",
+        fontsize=7.5)
+
+    grid_vals = {}
+    for name in FIG5_GRID_METHODS:
+        arr = np.array([[spurious["grid_recall_at_10"][f"{d}|{p}"][name]
+                          for p in spurious_rates_2d] for d in dropout_rates])
+        grid_vals[name] = arr
+
+    vmax = max(a.max() for a in grid_vals.values())
+    grid_axes = []
+    for i, name in enumerate(FIG5_GRID_METHODS):
+        ax = fig.add_subplot(gs[1, i], sharey=grid_axes[0] if grid_axes else None)
+        grid_axes.append(ax)
+        arr = grid_vals[name]
+        im = ax.imshow(arr, cmap="viridis", vmin=0.0, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(len(spurious_rates_2d)))
+        ax.set_xticklabels([f"{p:g}" for p in spurious_rates_2d], fontsize=6.0)
+        ax.set_yticks(range(len(dropout_rates)))
+        if i == 0:
+            ax.set_yticklabels([f"{d:g}" for d in dropout_rates], fontsize=6.0)
+            ax.set_ylabel("edge dropout", fontsize=6.5)
+        else:
+            ax.tick_params(labelleft=False)
+        ax.set_xlabel("spurious $p$", fontsize=6.5)
+        ax.set_title(name, fontsize=7.0)
+        for r in range(arr.shape[0]):
+            for c in range(arr.shape[1]):
+                v = arr[r, c]
+                txt_color = "white" if v < vmax * 0.6 else "black"
+                ax.text(c, r, f"{v:.2f}", ha="center", va="center", fontsize=5.3,
+                        color=txt_color)
+
+    cbar = fig.colorbar(im, ax=[fig.axes[i] for i in range(1, 1 + len(FIG5_GRID_METHODS))],
+                        fraction=0.05, pad=0.02)
+    cbar.ax.tick_params(labelsize=6.0)
+    cbar.set_label("recall@10", fontsize=6.5)
+
+    fig.suptitle(
+        "Graph degradation: missing edges (F7) x false-ancestor edges (N04), "
+        "results_spurious/", fontsize=6.5, y=0.995)
+    fig.savefig(out_stub.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(out_stub.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ------------------------------------------------------------------------- Fig 6 (N11)
+#
+# `results_decision/results_decision.json` stores only `mean`/`std` per method (n=60), not the
+# raw per-scenario correctness array `bootstrap_ci` needs - and this experiment needs Ollama
+# (LOCAL-ONLY), so a cloud night cannot regenerate it with a raw array. Instead, since
+# `decision_acc` is a Bernoulli mean over a KNOWN n, the exact success count is recoverable
+# (`round(mean * n)`), and a Wilson score interval (`stats.wilson_ci`, exact given n and the
+# count, no scipy) gives a real, non-fabricated 95% CI without re-running anything.
+
+def build_fig6_ci(decision: dict) -> dict:
+    """Recover (successes, n) from each method/control's stored `mean` and compute its Wilson
+    CI. Asserts `mean * n` is within float noise of an integer - if a future run's metric is
+    NOT a simple Bernoulli mean, this assertion catches it instead of silently mis-applying a
+    binomial CI to the wrong kind of number."""
+    n = decision["n"]
+    rows = {}
+    for name in FIG6_METHOD_ORDER:
+        mean = decision["methods"][name]["decision_acc"]["mean"]
+        successes = round(mean * n)
+        assert abs(mean * n - successes) < 1e-6, (name, mean, n)
+        phat, lo, hi = S.wilson_ci(successes, n)
+        rows[name] = {"successes": successes, "n": n, "mean": phat, "ci_lo": lo, "ci_hi": hi}
+    controls = {}
+    for name in ("no_retrieval", "oracle"):
+        mean = decision["controls"][name]["decision_acc"]["mean"]
+        successes = round(mean * n)
+        assert abs(mean * n - successes) < 1e-6, (name, mean, n)
+        phat, lo, hi = S.wilson_ci(successes, n)
+        controls[name] = {"successes": successes, "n": n, "mean": phat, "ci_lo": lo, "ci_hi": hi}
+    return {"n": n, "methods": rows, "controls": controls,
+            "note": "Wilson score CI from (successes=round(mean*n), n) - results_decision.json "
+                    "stores only mean/std, not a raw per-scenario array to bootstrap over, and "
+                    "this cloud sandbox cannot rerun the Ollama-backed decision experiment."}
+
+
+def draw_fig6(ci: dict, out_stub: Path) -> None:
+    names = FIG6_METHOD_ORDER
+    means = [ci["methods"][n]["mean"] for n in names]
+    los = [ci["methods"][n]["mean"] - ci["methods"][n]["ci_lo"] for n in names]
+    his = [ci["methods"][n]["ci_hi"] - ci["methods"][n]["mean"] for n in names]
+    colors = [FIG6_METHOD_COLORS[n] for n in names]
+
+    fig, ax = plt.subplots(figsize=(3.3, 3.1))
+    x = np.arange(len(names))
+    ax.bar(x, means, color=colors, edgecolor="black", linewidth=0.5, width=0.65, zorder=3,
+           yerr=[los, his], error_kw=dict(elinewidth=0.9, capsize=2.2, ecolor="#222222"))
+
+    floor = ci["controls"]["no_retrieval"]
+    ceiling = ci["controls"]["oracle"]
+    ax.axhline(floor["mean"], color="#555555", lw=1.0, ls="--", zorder=2)
+    ax.axhline(ceiling["mean"], color="#555555", lw=1.0, ls=":", zorder=2)
+    ax.text(len(names) - 0.4, floor["mean"] + 0.02, "no_retrieval floor",
+            ha="right", va="bottom", fontsize=6.0, color="#555555")
+    ax.text(len(names) - 0.4, ceiling["mean"] - 0.02, "oracle ceiling",
+            ha="right", va="top", fontsize=6.0, color="#555555")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=55, ha="right", fontsize=6.3)
+    ax.set_ylabel("decision accuracy", fontsize=8.0)
+    ax.set_ylim(0.0, 1.08)
+    ax.tick_params(labelsize=7.0)
+    ax.set_title(f"n={ci['n']}, Wilson 95% CI", fontsize=7.0)
+    fig.tight_layout(pad=0.25)
+    fig.savefig(out_stub.with_suffix(".pdf"))
+    fig.savefig(out_stub.with_suffix(".png"), dpi=220)
+    plt.close(fig)
+
+
 def _box(ax, xy, w, h, text, color, fontsize=8.0):
     x, y = xy
     box = FancyBboxPatch(
@@ -527,6 +705,12 @@ def main() -> None:
                     default=str(_TCMF_PAPER_DIR / "results_lambda_sweep" /
                                "results_lambda_sweep.json"),
                     help="N10 Fig 4 data, produced by `python -m tcmfbench.run_lambda_sweep`")
+    ap.add_argument("--spurious", type=str,
+                    default=str(_TCMF_PAPER_DIR / "results_spurious" / "results_spurious.json"),
+                    help="N11 Fig 5 data, produced by `python -m tcmfbench.run_spurious`")
+    ap.add_argument("--decision", type=str,
+                    default=str(_TCMF_PAPER_DIR / "results_decision" / "results_decision.json"),
+                    help="N11 Fig 6 data, produced by `python -m tcmfbench.run_decision`")
     args = ap.parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -561,6 +745,30 @@ def main() -> None:
         print(f"SKIPPED Fig 4: {sweep_path} not found - run "
               "`python -m tcmfbench.run_lambda_sweep --n 300 --n-seeds 5 "
               "--out results_lambda_sweep` first")
+
+    spurious_path = Path(args.spurious)
+    if spurious_path.exists():
+        spurious = json.loads(spurious_path.read_text())
+        draw_fig5(spurious, out_dir / "fig5_graph_degradation")
+        print(f"wrote {out_dir / 'fig5_graph_degradation.pdf'} / .png")
+    else:
+        print(f"SKIPPED Fig 5: {spurious_path} not found - run "
+              "`python -m tcmfbench.run_spurious --out results_spurious` first")
+
+    decision_path = Path(args.decision)
+    if decision_path.exists():
+        decision = json.loads(decision_path.read_text())
+        fig6_ci = build_fig6_ci(decision)
+        fig6_ci_path = out_dir / "fig6_decision_ci.json"
+        fig6_ci_path.write_text(json.dumps(fig6_ci, indent=2, sort_keys=True) + "\n")
+        reloaded6 = json.loads(fig6_ci_path.read_text())
+        draw_fig6(reloaded6, out_dir / "fig6_decision_accuracy")
+        print(f"wrote {fig6_ci_path}")
+        print(f"wrote {out_dir / 'fig6_decision_accuracy.pdf'} / .png")
+    else:
+        print(f"SKIPPED Fig 6: {decision_path} not found - run "
+              "`python -m tcmfbench.run_decision --n 60 --out results_decision` first "
+              "(needs Ollama)")
 
 
 if __name__ == "__main__":
